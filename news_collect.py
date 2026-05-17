@@ -2,12 +2,14 @@
 
 import logging
 import re
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 import feedparser
 import requests
+from deep_translator import MyMemoryTranslator
 from jinja2 import Template
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -38,6 +40,7 @@ FEEDS = [
 
 REQUEST_TIMEOUT = 20
 MAX_PER_FEED = 10
+MAX_AGE_DAYS = 7
 OUTPUT_DIR = Path(__file__).resolve().parent / "docs"
 OUTPUT_FILE = OUTPUT_DIR / "index.html"
 
@@ -85,6 +88,46 @@ def extract_image(entry: dict) -> Optional[str]:
 
     return None
 
+# ── Translation ──────────────────────────────────────────────────────────
+
+_translators: dict[str, MyMemoryTranslator] = {}
+
+
+def _get_translator(source: str = "en-GB") -> MyMemoryTranslator:
+    if source not in _translators:
+        _translators[source] = MyMemoryTranslator(source=source, target="zh-CN")
+    return _translators[source]
+
+
+def translate_text(text: str, source: str = "en-GB") -> str:
+    """Translate text to Chinese. Returns original text on failure."""
+    if not text or not text.strip():
+        return text
+    try:
+        return _get_translator(source).translate(text)
+    except Exception as e:
+        log.warning("Translation failed: %s", e)
+        return text
+
+
+def translate_entries(entries: list[dict]) -> list[dict]:
+    """Translate title and summary of each entry to Chinese."""
+    for entry in entries:
+        if entry.get("title"):
+            time.sleep(0.3)
+            try:
+                entry["title"] = translate_text(entry["title"])
+            except Exception as e:
+                log.warning("Title translation failed: %s", e)
+        if entry.get("summary"):
+            time.sleep(0.3)
+            try:
+                entry["summary"] = translate_text(entry["summary"])
+            except Exception as e:
+                log.warning("Summary translation failed: %s", e)
+    return entries
+
+
 # ── Fetch & parse ───────────────────────────────────────────────────────
 
 def fetch_feed(feed_def: dict) -> dict:
@@ -106,12 +149,17 @@ def fetch_feed(feed_def: dict) -> dict:
             result["error"] = "Parse error"
             return result
 
+        cutoff = datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)
+
         for entry in parsed.entries[:MAX_PER_FEED]:
             published = None
             if hasattr(entry, "published_parsed") and entry.published_parsed:
                 published = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
             elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
                 published = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
+
+            if published is not None and published < cutoff:
+                continue
 
             summary = entry.get("summary") or entry.get("description") or ""
             if isinstance(summary, str):
@@ -134,6 +182,11 @@ def fetch_feed(feed_def: dict) -> dict:
                 "published": published,
                 "image": extract_image(entry),
             })
+
+        # Translate English feeds to Chinese
+        if feed_def["lang"] == "en" and result["entries"]:
+            result["entries"] = translate_entries(result["entries"])
+            log.info("Translated %s: %d entries", feed_def["name"], len(result["entries"]))
 
         log.info("Fetched %s: %d entries", feed_def["name"], len(result["entries"]))
     except Exception as e:
